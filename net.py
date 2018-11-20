@@ -56,15 +56,14 @@ class PartialConv(nn.Module):
         super().__init__()
         self.input_conv = nn.Conv2d(in_channels, out_channels, kernel_size,
                                     stride, padding, dilation, groups, bias)
+        self.input_conv.apply(weights_init('kaiming'))
         self.mask_conv = nn.Conv2d(in_channels, out_channels, kernel_size,
                                    stride, padding, dilation, groups, False)
-        self.input_conv.apply(weights_init('kaiming'))
-
         torch.nn.init.constant_(self.mask_conv.weight, 1.0)
-
-        # mask is not updated
-        for param in self.mask_conv.parameters():
+        for param in self.mask_conv.parameters():      # mask is not updated
             param.requires_grad = False
+
+
 
     def forward(self, input, mask):
         # http://masc.cs.gmu.edu/wiki/partialconv
@@ -74,18 +73,64 @@ class PartialConv(nn.Module):
         output = self.input_conv(input * mask)
         if self.input_conv.bias is not None:
             output_bias = self.input_conv.bias.view(1, -1, 1, 1).expand_as(
-                output)
+                output)                        # expand the bias as the size of output to compute element wise minus
         else:
             output_bias = torch.zeros_like(output)
-
         with torch.no_grad():
             output_mask = self.mask_conv(mask)
 
-        no_update_holes = output_mask == 0
-        mask_sum = output_mask.masked_fill_(no_update_holes, 1.0)
+        no_update_holes = output_mask == 0                      # record no update holes as 1 in map
+        output_mask.masked_fill_(no_update_holes, 1.0)          # Avoid exception of  value/0
 
-        output_pre = (output - output_bias) / mask_sum + output_bias
-        output = output_pre.masked_fill_(no_update_holes, 0.0)
+        output = (output - output_bias) / output_mask + output_bias
+        output.masked_fill_(no_update_holes, 0.0)
+
+        new_mask = torch.ones_like(output)
+        new_mask = new_mask.masked_fill_(no_update_holes, 0.0)
+
+        return output, new_mask
+
+
+class UnidirectionalPConv(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1,
+                 padding=0, dilation=1, groups=1, bias=True):
+        super().__init__()
+        self.input_conv = nn.Conv2d(in_channels, out_channels, kernel_size,
+                                    stride, padding, dilation, groups, bias)
+        self.input_conv.apply(weights_init('kaiming'))
+        self.mask_conv = nn.Conv2d(in_channels, out_channels, kernel_size,
+                                   stride, padding, dilation, groups, False)
+        self.count_conv = nn.Conv2d(in_channels, out_channels, kernel_size,
+                                   stride, padding, dilation, groups, False)
+        torch.nn.init.constant_(self.mask_conv.weight, 1.0)
+        torch.nn.init.constant_(self.count_conv.weight, 1.0)
+        # mask is not updated
+        for param in self.mask_conv.parameters():
+            param.requires_grad = False
+        for param in self.count_conv.parameters():
+            param.requires_grad = False
+        self.mask_conv.weight[:, :, :, :math.floor(kernel_size / 2)] = 0   #For Unidirectional Conv
+
+    def forward(self, input, mask):
+        # http://masc.cs.gmu.edu/wiki/partialconv
+        # C(X) = W^T * X + b, C(0) = b, D(M) = 1 * M + 0 = sum(M)
+        # W^T* (M .* X) / sum(M) + b = [C(M .* X) – C(0)] / D(M) + C(0)
+
+        output = self.input_conv(input * mask)
+        if self.input_conv.bias is not None:
+            output_bias = self.input_conv.bias.view(1, -1, 1, 1).expand_as(
+                output)                        # expand the bias as the size of output to compute element wise minus
+        else:
+            output_bias = torch.zeros_like(output)
+        with torch.no_grad():
+            output_mask = self.mask_conv(mask)
+            count_mask = self.count_conv(mask)
+
+        no_update_holes = output_mask == 0                      # record no update holes as 1 in map
+        count_mask.masked_fill_(no_update_holes, 1.0)          # Avoid exception of  value/0
+
+        output = (output - output_bias) / count_mask + output_bias
+        output.masked_fill_(no_update_holes, 0.0)
 
         new_mask = torch.ones_like(output)
         new_mask = new_mask.masked_fill_(no_update_holes, 0.0)
@@ -98,13 +143,13 @@ class PCBActiv(nn.Module):
                  conv_bias=False):
         super().__init__()
         if sample == 'down-5':
-            self.conv = PartialConv(in_ch, out_ch, 5, 2, 2, bias=conv_bias)
+            self.conv = UnidirectionalPConv(in_ch, out_ch, 5, 2, 2, bias=conv_bias)
         elif sample == 'down-7':
-            self.conv = PartialConv(in_ch, out_ch, 7, 2, 3, bias=conv_bias)
+            self.conv = UnidirectionalPConv(in_ch, out_ch, 7, 2, 3, bias=conv_bias)
         elif sample == 'down-3':
-            self.conv = PartialConv(in_ch, out_ch, 3, 2, 1, bias=conv_bias)
+            self.conv = UnidirectionalPConv(in_ch, out_ch, 3, 2, 1, bias=conv_bias)
         else:
-            self.conv = PartialConv(in_ch, out_ch, 3, 1, 1, bias=conv_bias)
+            self.conv = UnidirectionalPConv(in_ch, out_ch, 3, 1, 1, bias=conv_bias)
 
         if bn:
             self.bn = nn.BatchNorm2d(out_ch)
@@ -193,12 +238,13 @@ class PConvUNet(nn.Module):
 
 
 if __name__ == '__main__':
+    torch.manual_seed(2)
     size = (1, 3, 5, 5)
     input = torch.ones(size)
     input_mask = torch.ones(size)
-    input_mask[:, :, 2:, :][:, :, :, 2:] = 0
+    input_mask[:, :, 1:4, :][:, :, :, 1:4] = 0
 
-    conv = PartialConv(3, 3, 3, 1, 1)
+    conv = UnidirectionalPConv(3, 3, 3, 1, 1)
     l1 = nn.L1Loss()
     input.requires_grad = True
 
@@ -210,5 +256,6 @@ if __name__ == '__main__':
     assert (torch.sum(torch.isnan(conv.input_conv.weight.grad)).item() == 0)
     assert (torch.sum(torch.isnan(conv.input_conv.bias.grad)).item() == 0)
 
+    print("success")
     # model = PConvUNet()
     # output, output_mask = model(input, input_mask)

@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 def gram_matrix(feat):
     # https://github.com/pytorch/examples/blob/master/fast_neural_style/neural_style/utils.py
     (b, ch, h, w) = feat.size()
@@ -10,11 +10,22 @@ def gram_matrix(feat):
     gram = torch.bmm(feat, feat_t) / (ch * h * w)
     return gram
 
+def dialation_holes(hole_mask):
+    b, ch, h, w = hole_mask.shape
+    dilation_conv = nn.Conv2d(ch, ch, 3, padding=1, bias=False).to(device)
+    torch.nn.init.constant_(dilation_conv.weight, 1.0)
+    with torch.no_grad():
+        output_mask = dilation_conv(hole_mask)
+    updated_holes = output_mask != 0
+    return updated_holes.float()
 
-def total_variation_loss(image):
-    # shift one pixel and get difference (for both x and y direction)
-    loss = torch.mean(torch.abs(image[:, :, :, :-1] - image[:, :, :, 1:])) + \
-        torch.mean(torch.abs(image[:, :, :-1, :] - image[:, :, 1:, :]))
+def total_variation_loss(image,mask):
+    hole_mask = 1-mask
+    dilated_holes=dialation_holes(hole_mask)
+    colomns_in_Pset=dilated_holes[:, :, :, 1:] * dilated_holes[:, :, :, :-1]
+    rows_in_Pset=dilated_holes[:, :, 1:, :] * dilated_holes[:, :, :-1:, :]
+    loss = torch.sum(torch.abs(colomns_in_Pset*(image[:, :, :, 1:] - image[:, :, :, :-1]))) + \
+        torch.sum(torch.abs(rows_in_Pset*(image[:, :, :1 :] - image[:, :, -1:, :])))
     return loss
 
 
@@ -54,6 +65,14 @@ class InpaintingLoss(nn.Module):
             loss_dict['style'] += self.l1(gram_matrix(feat_output_comp[i]),
                                           gram_matrix(feat_gt[i]))
 
-        loss_dict['tv'] = total_variation_loss(output_comp)
+        loss_dict['tv'] = total_variation_loss(output_comp,mask)
 
         return loss_dict
+
+
+if __name__ == '__main__':
+    hole_mask = torch.zeros(1, 3, 3, 3)
+    #hole_mask[:, :, :, 0] = 1
+    hole_mask[:, :, 1, 1]=1
+    print(hole_mask)
+    print(dialation_holes(hole_mask))
